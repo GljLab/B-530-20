@@ -66,6 +66,8 @@ public class SecurityConfig {
             .authorizeRequests()
                 // 放行登录接口和静态资源
                 .antMatchers("/api/auth/login", "/api/auth/register", "/api/file/upload/**", "/uploads/**").permitAll()
+                // 放行健康检查端点
+                .antMatchers("/actuator/health", "/actuator/info").permitAll()
                 // 其他请求需要认证
                 .anyRequest().authenticated()
             .and()

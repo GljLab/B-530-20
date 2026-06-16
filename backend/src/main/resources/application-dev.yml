@@ -1,0 +1,25 @@
+spring:
+  datasource:
+    hikari:
+      minimum-idle: 5
+      maximum-pool-size: 10
+      idle-timeout: 60000
+      connection-timeout: 60000
+
+jwt:
+  expiration: 86400000
+
+cors:
+  allowed-origins: "*"
+
+logging:
+  level:
+    root: DEBUG
+    "[com.example.permission]": DEBUG
+    "[com.mybatisflex]": DEBUG
+    "[org.springframework.security]": DEBUG
+
+management:
+  endpoint:
+    health:
+      show-details: always
