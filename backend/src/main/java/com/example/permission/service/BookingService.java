@@ -2,9 +2,15 @@ package com.example.permission.service;
 
 import com.example.permission.common.BusinessException;
 import com.example.permission.common.PageResult;
+import com.example.permission.dto.BookingUpdateRequest;
+import com.example.permission.dto.FieldChange;
 import com.example.permission.entity.*;
 import com.example.permission.mapper.*;
 import com.example.permission.security.LoginUser;
+import com.example.permission.service.strategy.AbstractFieldUpdateStrategy;
+import com.example.permission.service.strategy.FieldUpdateStrategy;
+import com.example.permission.service.strategy.FieldUpdateStrategyFactory;
+import com.example.permission.utils.BookingFieldAccessor;
 import com.mybatisflex.core.paginate.Page;
 import com.mybatisflex.core.query.QueryWrapper;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -72,6 +78,15 @@ public class BookingService {
 
     @Autowired
     private RoomService roomService;
+
+    @Autowired
+    private FieldUpdateStrategyFactory strategyFactory;
+
+    @Autowired
+    private PriceRecalculationService priceRecalculationService;
+
+    @Autowired
+    private BookingFieldAccessor bookingFieldAccessor;
 
     public Map<Long, List<Room>> queryAvailableRooms(LocalDate checkInDate, LocalDate checkOutDate,
                                                       Long roomTypeId, Long floorId, String orientation,
@@ -717,119 +732,41 @@ public class BookingService {
             throw new BusinessException("预订不存在");
         }
 
-        boolean dateChanged = false;
-        LocalDate newCheckInDate = existing.getCheckInDate();
-        LocalDate newCheckOutDate = existing.getCheckOutDate();
-
         if (changedFields != null && !changedFields.isEmpty()) {
-            String operatorName = loginUser.getUser().getNickname() != null ?
-                    loginUser.getUser().getNickname() : loginUser.getUsername();
+            String operatorName = getOperatorName(loginUser);
+            boolean needsPriceRecalculation = false;
 
             for (Map.Entry<String, Object> entry : changedFields.entrySet()) {
                 String fieldName = entry.getKey();
                 Object newValue = entry.getValue();
-                String oldValueStr = getFieldValue(existing, fieldName);
-                String newValueStr = newValue != null ? newValue.toString() : "";
 
-                switch (fieldName) {
-                    case "checkInDate":
-                        newCheckInDate = (LocalDate) newValue;
-                        dateChanged = true;
-                        break;
-                    case "checkOutDate":
-                        newCheckOutDate = (LocalDate) newValue;
-                        dateChanged = true;
-                        break;
-                    case "customerName":
-                        existing.setCustomerName((String) newValue);
-                        break;
-                    case "customerPhone":
-                        existing.setCustomerPhone((String) newValue);
-                        break;
-                    case "guestCount":
-                        existing.setGuestCount((Integer) newValue);
-                        break;
-                    case "guestNames":
-                        existing.setGuestNames((String) newValue);
-                        break;
-                    case "guestPhone":
-                        existing.setGuestPhone((String) newValue);
-                        break;
-                    case "extraBedCount":
-                        existing.setExtraBedCount((Integer) newValue);
-                        break;
-                    case "extraBedPrice":
-                        existing.setExtraBedPrice((BigDecimal) newValue);
-                        break;
-                    case "discount":
-                        existing.setDiscount((BigDecimal) newValue);
-                        break;
-                    case "otherFee":
-                        existing.setOtherFee((BigDecimal) newValue);
-                        break;
-                    case "specialRequirements":
-                        existing.setSpecialRequirements((String) newValue);
-                        break;
-                    case "bookingSource":
-                        existing.setBookingSource((String) newValue);
-                        break;
-                    case "sourceRemark":
-                        existing.setSourceRemark((String) newValue);
-                        break;
-                    case "guaranteeType":
-                        existing.setGuaranteeType((String) newValue);
-                        break;
-                    case "expectedArrivalTime":
-                        existing.setExpectedArrivalTime((LocalDateTime) newValue);
-                        break;
+                if (strategyFactory.hasStrategy(fieldName)) {
+                    FieldUpdateStrategy<Object> strategy = strategyFactory.getStrategy(fieldName);
+                    Object oldValue = getOldValue(existing, strategy);
+
+                    strategy.validate(oldValue, newValue, existing, loginUser);
+
+                    String oldValueStr = strategy.formatValue(oldValue);
+                    String newValueStr = strategy.formatValue(newValue);
+
+                    strategy.apply(existing, newValue);
+
+                    if (strategy.triggersPriceRecalculation()) {
+                        needsPriceRecalculation = true;
+                    }
+
+                    recordChangeLog(existing.getId(), existing.getBookingNo(), fieldName,
+                            oldValueStr, newValueStr, strategy.getChangeType(),
+                            strategy.getRemark(), loginUser.getUserId(), operatorName);
                 }
-
-                recordChangeLog(existing.getId(), existing.getBookingNo(), fieldName,
-                        oldValueStr, newValueStr, "修改",
-                        "修改预订信息", loginUser.getUserId(), operatorName);
-            }
-        }
-
-        if (dateChanged) {
-            if (newCheckOutDate.isBefore(newCheckInDate) || newCheckOutDate.isEqual(newCheckInDate)) {
-                throw new BusinessException("退房日期必须晚于入住日期");
-            }
-            if (!checkRoomAvailability(existing.getRoomId(), newCheckInDate,
-                    newCheckOutDate, existing.getId())) {
-                throw new BusinessException("所选房间在新的日期范围内已被预订");
             }
 
-            RoomType roomType = roomTypeMapper.selectOneById(existing.getRoomTypeId());
-            if (roomType != null) {
-                int days = (int) java.time.temporal.ChronoUnit.DAYS.between(newCheckInDate, newCheckOutDate);
-                BigDecimal roomTotal = calculatePrice(roomType, newCheckInDate, newCheckOutDate,
-                        existing.getExtraBedCount(), existing.getExtraBedPrice());
-
-                BigDecimal extraBedTotal = BigDecimal.ZERO;
-                if (existing.getExtraBedCount() != null && existing.getExtraBedCount() > 0
-                        && existing.getExtraBedPrice() != null) {
-                    extraBedTotal = existing.getExtraBedPrice()
-                            .multiply(BigDecimal.valueOf(existing.getExtraBedCount()))
-                            .multiply(BigDecimal.valueOf(days));
+            if (needsPriceRecalculation) {
+                if (!checkRoomAvailability(existing.getRoomId(), existing.getCheckInDate(),
+                        existing.getCheckOutDate(), existing.getId())) {
+                    throw new BusinessException("所选房间在新的日期范围内已被预订");
                 }
-
-                BigDecimal totalAmount = roomTotal.add(extraBedTotal)
-                        .subtract(existing.getDiscount() != null ? existing.getDiscount() : BigDecimal.ZERO)
-                        .add(existing.getOtherFee() != null ? existing.getOtherFee() : BigDecimal.ZERO);
-
-                existing.setCheckInDate(newCheckInDate);
-                existing.setCheckOutDate(newCheckOutDate);
-                existing.setDays(days);
-                existing.setRoomTotal(roomTotal);
-                existing.setExtraBedTotal(extraBedTotal);
-                existing.setTotalAmount(totalAmount.setScale(2, RoundingMode.HALF_UP));
-
-                QueryWrapper deleteDetailQuery = QueryWrapper.create()
-                        .from(BookingDetail.class)
-                        .where(BOOKING_DETAIL.BOOKING_ID.eq(existing.getId()));
-                bookingDetailMapper.deleteByQuery(deleteDetailQuery);
-
-                generateBookingDetails(existing, roomType);
+                priceRecalculationService.recalculatePrice(existing);
             }
         }
 
@@ -837,46 +774,75 @@ public class BookingService {
         bookingMapper.update(existing);
     }
 
+    @Transactional(rollbackFor = Exception.class)
+    public void updateBooking(BookingUpdateRequest request, LoginUser loginUser) {
+        if (request == null || request.getBookingId() == null) {
+            throw new BusinessException("预订ID不能为空");
+        }
+
+        Booking existing = bookingMapper.selectOneById(request.getBookingId());
+        if (existing == null) {
+            throw new BusinessException("预订不存在");
+        }
+
+        List<FieldChange<?>> changes = request.getChangedFields(existing);
+        if (changes.isEmpty()) {
+            return;
+        }
+
+        String operatorName = getOperatorName(loginUser);
+        boolean needsPriceRecalculation = false;
+
+        for (FieldChange<?> change : changes) {
+            applyFieldChange(existing, change, loginUser, operatorName);
+            FieldUpdateStrategy<?> strategy = strategyFactory.getStrategy(change.getFieldName());
+            if (strategy.triggersPriceRecalculation()) {
+                needsPriceRecalculation = true;
+            }
+        }
+
+        if (needsPriceRecalculation) {
+            if (!checkRoomAvailability(existing.getRoomId(), existing.getCheckInDate(),
+                    existing.getCheckOutDate(), existing.getId())) {
+                throw new BusinessException("所选房间在新的日期范围内已被预订");
+            }
+            priceRecalculationService.recalculatePrice(existing);
+        }
+
+        existing.setUpdateTime(LocalDateTime.now());
+        bookingMapper.update(existing);
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> void applyFieldChange(Booking booking, FieldChange<T> change,
+                                       LoginUser loginUser, String operatorName) {
+        FieldUpdateStrategy<T> strategy = strategyFactory.getStrategy(change.getFieldName());
+        strategy.validate(change.getOldValue(), change.getNewValue(), booking, loginUser);
+        strategy.apply(booking, change.getNewValue());
+
+        String oldValueStr = strategy.formatValue(change.getOldValue());
+        String newValueStr = strategy.formatValue(change.getNewValue());
+
+        recordChangeLog(booking.getId(), booking.getBookingNo(), change.getFieldName(),
+                oldValueStr, newValueStr, strategy.getChangeType(),
+                strategy.getRemark(), loginUser.getUserId(), operatorName);
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> T getOldValue(Booking booking, FieldUpdateStrategy<T> strategy) {
+        if (strategy instanceof AbstractFieldUpdateStrategy) {
+            return ((AbstractFieldUpdateStrategy<T>) strategy).getValue(booking);
+        }
+        return null;
+    }
+
+    private String getOperatorName(LoginUser loginUser) {
+        return loginUser.getUser().getNickname() != null ?
+                loginUser.getUser().getNickname() : loginUser.getUsername();
+    }
+
     private String getFieldValue(Booking booking, String fieldName) {
-        if (booking == null || fieldName == null) {
-            return "";
-        }
-        switch (fieldName) {
-            case "checkInDate":
-                return booking.getCheckInDate() != null ? booking.getCheckInDate().toString() : "";
-            case "checkOutDate":
-                return booking.getCheckOutDate() != null ? booking.getCheckOutDate().toString() : "";
-            case "customerName":
-                return booking.getCustomerName() != null ? booking.getCustomerName() : "";
-            case "customerPhone":
-                return booking.getCustomerPhone() != null ? booking.getCustomerPhone() : "";
-            case "guestCount":
-                return booking.getGuestCount() != null ? booking.getGuestCount().toString() : "";
-            case "guestNames":
-                return booking.getGuestNames() != null ? booking.getGuestNames() : "";
-            case "guestPhone":
-                return booking.getGuestPhone() != null ? booking.getGuestPhone() : "";
-            case "extraBedCount":
-                return booking.getExtraBedCount() != null ? booking.getExtraBedCount().toString() : "";
-            case "extraBedPrice":
-                return booking.getExtraBedPrice() != null ? booking.getExtraBedPrice().toString() : "";
-            case "discount":
-                return booking.getDiscount() != null ? booking.getDiscount().toString() : "";
-            case "otherFee":
-                return booking.getOtherFee() != null ? booking.getOtherFee().toString() : "";
-            case "specialRequirements":
-                return booking.getSpecialRequirements() != null ? booking.getSpecialRequirements() : "";
-            case "bookingSource":
-                return booking.getBookingSource() != null ? booking.getBookingSource() : "";
-            case "sourceRemark":
-                return booking.getSourceRemark() != null ? booking.getSourceRemark() : "";
-            case "guaranteeType":
-                return booking.getGuaranteeType() != null ? booking.getGuaranteeType() : "";
-            case "expectedArrivalTime":
-                return booking.getExpectedArrivalTime() != null ? booking.getExpectedArrivalTime().toString() : "";
-            default:
-                return "";
-        }
+        return bookingFieldAccessor.getFieldValue(booking, fieldName);
     }
 
     @Transactional(rollbackFor = Exception.class)
